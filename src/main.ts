@@ -17,6 +17,8 @@ export {NonZeroExitError, normalizeSpawnCommand};
 
 const LINE_SEPARATOR_REGEX = /\r?\n/;
 
+const pipedStreams = new WeakSet<Readable>();
+
 export interface Output {
   stderr: string;
   stdout: string;
@@ -334,6 +336,7 @@ export class ExecProcess implements Result {
 
     this._process = handle;
     handle.once('error', this._onError);
+    handle.once('exit', this._onExit);
     handle.once('close', this._onClose);
 
     if (handle.stdin) {
@@ -342,7 +345,11 @@ export class ExecProcess implements Result {
       if (typeof stdin === 'string') {
         handle.stdin.end(stdin);
       } else {
-        stdin?.process?.stdout?.pipe(handle.stdin);
+        const src = stdin?.process?.stdout;
+        if (src) {
+          src.pipe(handle.stdin);
+          pipedStreams.add(src);
+        }
       }
     }
   }
@@ -364,6 +371,28 @@ export class ExecProcess implements Result {
       return;
     }
     this._thrownError = err;
+  };
+
+  protected _onExit = (): void => {
+    // Node emits 'exit' before stdio streams have drained. Use setImmediate
+    // to let buffered data flow through before destroying the streams.
+    // If grandchild processes hold the pipe fds open, they would never fire
+    // 'close', so we destroy here to unblock readStream and combineStreams.
+    const out =
+      this._streamOut && !pipedStreams.has(this._streamOut)
+        ? this._streamOut
+        : undefined;
+    const err =
+      this._streamErr && !pipedStreams.has(this._streamErr)
+        ? this._streamErr
+        : undefined;
+    if (!out && !err) {
+      return;
+    }
+    setImmediate(() => {
+      out?.destroy();
+      err?.destroy();
+    });
   };
 
   protected _onClose = (): void => {
